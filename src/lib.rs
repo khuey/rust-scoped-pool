@@ -103,6 +103,24 @@ impl Pool {
         Scope::forever(self.clone()).execute(job)
     }
 
+    /// Spawn a `'limit` job to be run on this pool.
+    ///
+    /// `spawn_limited` does not wait on the job to complete. Instead it returns
+    /// a LimitedScope. When this object is dropped it will join the pool to
+    /// ensure that the job is complete.
+    ///
+    /// The LimitedScope must be dropped! Safe Rust allows for objects to be
+    /// leaked and destructors to never run, so this is unsafe as the callee
+    /// must guarantee that the object is dropped or job could survive beyond
+    /// the `'limit` lifetime.
+    pub unsafe fn spawn_limited<'limit, F>(&self, job: F) -> LimitedScope<'limit>
+        where F: FnOnce() + Send + 'limit
+    {
+        let scope = Scope::limited(self.clone());
+        scope.execute(job);
+        LimitedScope(scope)
+    }
+
     /// Create a Scope for scheduling a group of jobs in `'scope'`.
     ///
     /// `scoped` will return only when the `scheduler` function and
@@ -285,6 +303,18 @@ impl<'scope> Scope<'scope> {
         }
     }
 
+    /// Create a Scope bound to `'limit`.
+    /// This is unsafe because the caller must ensure that the Scope is joined
+    /// before `'limit` expires.
+    #[inline]
+    pub unsafe fn limited<'limit>(pool: Pool) -> Scope<'limit> {
+        Scope {
+            pool: pool,
+            wait: Arc::new(WaitGroup::new()),
+            _scope: Id::default()
+        }
+    }
+
     /// Add a job to this scope.
     ///
     /// Subsequent calls to `join` will wait for this job to complete.
@@ -358,6 +388,16 @@ impl<'scope> Scope<'scope> {
             wait: Arc::new(WaitGroup::new()),
             _scope: Id::default()
         }
+    }
+}
+
+/// A LimitedScope is returned by `Pool::spawn_limited`. The caller must
+/// guarantee that it is dropped.
+pub struct LimitedScope<'scope>(Scope<'scope>);
+
+impl<'scope> Drop for LimitedScope<'scope> {
+    fn drop(&mut self) {
+        self.0.join()
     }
 }
 
@@ -512,6 +552,7 @@ impl<F: FnOnce()> Task for F {
 #[cfg(test)]
 mod test {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
     use std::thread::sleep;
 
@@ -747,6 +788,27 @@ mod test {
                 assert_eq!(::std::thread::current().name().unwrap(), "pool-1");
             });
         });
+    }
+
+    #[test]
+    fn test_spawn_limited() {
+        let pool = Pool::new(1);
+
+        let mutex = Mutex::new(0);
+
+        {
+            let mutex_ref = &mutex;
+
+            let _ = unsafe {
+                let _ = mutex.lock().unwrap();
+                pool.spawn_limited(|| {
+                    let mut locked = mutex_ref.lock().unwrap();
+                    *locked = 42;
+                })
+            };
+        }
+
+        assert_eq!(mutex.into_inner().unwrap(), 42);
     }
 }
 
